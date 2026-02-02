@@ -36,6 +36,10 @@ let dbInitialized = false
 let dbInitializing = false
 let duckdbPath: string | null = null
 
+// Promise-chain mutex for serializing DB access
+// Prevents concurrent CLI invocations which cause constraint errors
+let dbLock: Promise<void> = Promise.resolve()
+
 /**
  * Initialize the app database with required tables
  * Includes retry logic for lock contention
@@ -85,7 +89,7 @@ export async function initAppDb(): Promise<void> {
       );
 
       CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
-      CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
+      -- Note: idx_sessions_updated_at removed - causes DuckDB bug with UPDATE statements
       CREATE INDEX IF NOT EXISTS idx_branches_parent ON branches(parent_session_id);
 
       CREATE TABLE IF NOT EXISTS playbooks (
@@ -165,15 +169,26 @@ export async function initAppDb(): Promise<void> {
 
 /**
  * Run a query against the app database
+ * Uses a promise-chain mutex to serialize all queries and prevent concurrent CLI access
  */
 async function runQuery(sql: string): Promise<Record<string, unknown>[]> {
   if (!duckdbPath) {
     duckdbPath = getDuckDBPath()
   }
 
-  const fullSql = sql.replace(/;?\s*$/, ';')
+  // Serialize all queries to prevent concurrent CLI access
+  // This prevents DuckDB constraint errors from race conditions
+  const previousLock = dbLock
+  let releaseLock: () => void
+  dbLock = new Promise(resolve => {
+    releaseLock = resolve
+  })
+
+  await previousLock // Wait for previous query to complete
 
   try {
+    const fullSql = sql.replace(/;?\s*$/, ';')
+
     const { stdout } = await execAsync(
       `${duckdbPath} "${APP_DB_PATH}" -json -c "${fullSql.replace(/"/g, '\\"').replace(/\n/g, ' ')}"`,
       { maxBuffer: 10 * 1024 * 1024 }
@@ -188,6 +203,8 @@ async function runQuery(sql: string): Promise<Record<string, unknown>[]> {
   } catch (error: unknown) {
     const errMsg = error instanceof Error ? error.message : String(error)
     throw new Error(`AppDB Error: ${errMsg}`)
+  } finally {
+    releaseLock!()
   }
 }
 
@@ -225,6 +242,7 @@ export async function upsertSession(
 
   // First try to insert, if conflict then update
   // IMPORTANT: Include sandbox_id and sandbox_status to preserve them when replacing!
+  // Note: Preserve updated_at for existing sessions - only update on actual user activity
   const insertSql = `
     INSERT OR REPLACE INTO sessions (id, user_id, title, sandbox_id, sandbox_status, created_at, updated_at, message_count)
     VALUES (
@@ -234,7 +252,7 @@ export async function upsertSession(
       (SELECT sandbox_id FROM sessions WHERE id = '${sessionId}'),
       (SELECT sandbox_status FROM sessions WHERE id = '${sessionId}'),
       COALESCE((SELECT created_at FROM sessions WHERE id = '${sessionId}'), '${now}'),
-      '${now}',
+      COALESCE((SELECT updated_at FROM sessions WHERE id = '${sessionId}'), '${now}'),
       COALESCE((SELECT message_count FROM sessions WHERE id = '${sessionId}'), 0)
     )
   `
@@ -337,35 +355,14 @@ export async function setSessionSandbox(sessionId: string, sandboxId: string): P
   validateIdentifier(sessionId, 'sessionId')
   if (sandboxId) validateIdentifier(sandboxId, 'sandboxId')
 
-  // Use INSERT OR REPLACE to work around DuckDB UPDATE constraint issues
-  // We need to preserve all existing fields when replacing
-  const now = new Date().toISOString()
-  const sql = `
-    INSERT OR REPLACE INTO sessions (id, user_id, title, sandbox_id, sandbox_status, created_at, updated_at, message_count)
-    SELECT
-      id,
-      user_id,
-      title,
-      '${sandboxId}',
-      sandbox_status,
-      created_at,
-      '${now}',
-      message_count
-    FROM sessions
+  // Note: Don't update updated_at here - that should only change on actual user activity
+  const updateSql = `
+    UPDATE sessions
+    SET sandbox_id = '${sandboxId}'
     WHERE id = '${sessionId}'
   `
 
-  try {
-    await runQuery(sql)
-  } catch {
-    // Fallback: try direct UPDATE if INSERT OR REPLACE fails
-    const updateSql = `
-      UPDATE sessions
-      SET sandbox_id = '${sandboxId}', updated_at = '${now}'
-      WHERE id = '${sessionId}'
-    `
-    await runQuery(updateSql)
-  }
+  await runQuery(updateSql)
 }
 
 /**
@@ -381,32 +378,19 @@ export async function setSessionSandboxStatus(
   validateIdentifier(sessionId, 'sessionId')
   validateIdentifier(sandboxId, 'sandboxId')
 
-  const now = new Date().toISOString()
-  const sql = `
-    INSERT OR REPLACE INTO sessions (id, user_id, title, sandbox_id, sandbox_status, created_at, updated_at, message_count)
-    SELECT
-      id,
-      user_id,
-      title,
-      '${sandboxId}',
-      '${status}',
-      created_at,
-      '${now}',
-      message_count
-    FROM sessions
+  // Use simple UPDATE - session should already exist from upsertSession call
+  // Note: Don't update updated_at here - that should only change on actual user activity
+  const updateSql = `
+    UPDATE sessions
+    SET sandbox_id = '${sandboxId}', sandbox_status = '${status}'
     WHERE id = '${sessionId}'
   `
 
   try {
-    await runQuery(sql)
-  } catch {
-    // Fallback: try direct UPDATE if INSERT OR REPLACE fails
-    const updateSql = `
-      UPDATE sessions
-      SET sandbox_id = '${sandboxId}', sandbox_status = '${status}', updated_at = '${now}'
-      WHERE id = '${sessionId}'
-    `
     await runQuery(updateSql)
+  } catch (err) {
+    // If update fails, the session might not exist yet - this is OK, it will be created later
+    console.warn(`[AppDB] Failed to update sandbox status for session ${sessionId}:`, err)
   }
 }
 

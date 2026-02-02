@@ -75,7 +75,11 @@ export function useSelectChatSession() {
       setSessionId(sessionId)
       setProjectId(projectId)
       setMessages([])
-      setSessionInfo(createDefaultChatSessionInfo())
+      // Set isLoading: true when switching sessions - will be set to false when messages arrive
+      setSessionInfo({
+        ...createDefaultChatSessionInfo(),
+        isLoading: sessionId !== null, // Only loading if we're switching TO a session
+      })
     },
     [setMessages, setProjectId, setSessionId, setSessionInfo],
   )

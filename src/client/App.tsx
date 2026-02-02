@@ -388,7 +388,8 @@ function App() {
     sendBranchMessage,
   })
 
-  const isStreaming = isBusy || isLoading
+  // isStreaming is only for actual chat activity, not session loading
+  const isStreaming = isBusy
 
   const handlePromptSubmit = useCallback(
     async (message: string, attachments: AttachedFile[]) => {
@@ -541,6 +542,7 @@ function App() {
                 <MessagesPane
                   messages={messages}
                   isStreaming={isStreaming}
+                  isLoading={isLoading}
                   worldlines={worldlines}
                   currentSessionId={sessionId}
                   onWorldlineNavigate={handleWorldlineNavigate}

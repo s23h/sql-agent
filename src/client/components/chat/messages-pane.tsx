@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import type { ChatMessage } from '@claude-agent-kit/messages'
 import type { ClaudeMessageContext } from '../messages/types'
@@ -8,9 +8,30 @@ import { Message, BranchButton } from '../messages/message'
 import { ThinkingIndicator } from './thinking-indicator'
 import { WorldlineNavigator, type WorldlineBranch } from '../messages/worldline-navigator'
 
+// Simple spinner for session loading - just the symbol, no text
+const SPINNER_FRAMES = ['·', '✢', '*', '✶', '✻', '✽', '✻', '✶', '*', '✢'] as const
+
+function LoadingSpinner() {
+  const [frame, setFrame] = useState(0)
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setFrame(f => (f + 1) % SPINNER_FRAMES.length)
+    }, 120)
+    return () => clearInterval(interval)
+  }, [])
+
+  return (
+    <span className="text-green-500 text-2xl font-mono">
+      {SPINNER_FRAMES[frame]}
+    </span>
+  )
+}
+
 type MessagesPaneProps = {
   messages: ChatMessage[]
   isStreaming: boolean
+  isLoading?: boolean  // True when switching sessions and loading messages
   worldlines?: WorldlineBranch[]  // All worldlines in the family
   currentSessionId?: string | null
   onWorldlineNavigate?: (sessionId: string) => void
@@ -25,6 +46,7 @@ type MessagesPaneProps = {
 export function MessagesPane({
   messages,
   isStreaming,
+  isLoading = false,
   worldlines = [],
   currentSessionId,
   onWorldlineNavigate,
@@ -127,7 +149,14 @@ export function MessagesPane({
     <div className="flex-1 overflow-y-auto px-4 py-4 overflow-x-hidden flex-col relative">
       <div className="flex flex-col gap-0">
         {messages.length === 0 ? (
-          <EmptyState context={context} />
+          isLoading ? (
+            // Show simple spinner when loading a session
+            <div className="flex flex-col items-center justify-center min-h-[60vh]">
+              <LoadingSpinner />
+            </div>
+          ) : (
+            <EmptyState context={context} />
+          )
         ) : (
           messages.map((message, index) => {
             // Check if the PREVIOUS message is a branch point (for showing navigator below this user message)

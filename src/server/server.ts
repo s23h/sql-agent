@@ -30,6 +30,9 @@ export interface CreateServerOptions {
 const wsSandboxMap = new Map<WebSocket, string>()
 const wsUserMap = new Map<WebSocket, string>()
 
+// Track sandbox switching state per WebSocket - prevents race conditions
+const wsSandboxSwitchingPromise = new Map<WebSocket, Promise<void>>()
+
 // Track current active connection for sandbox provider
 let currentWs: WebSocket | null = null
 let currentSessionId: string | null = null
@@ -248,9 +251,6 @@ export async function createServer(options: CreateServerOptions = {}) {
   async function tryReconnectSessionSandbox(ws: WebSocket, sessionId: string): Promise<void> {
     try {
       const session = await getSession(sessionId)
-      if (!session?.sandboxId) {
-        return
-      }
 
       // Get latest snapshot for this session (or from parent branch)
       const projectId = getCurrentProjectId()
@@ -265,20 +265,17 @@ export async function createServer(options: CreateServerOptions = {}) {
       }
 
       // Use getOrCreateSandbox for graceful degradation
+      // This handles: session with sandbox, session without sandbox, failed reconnect (creates new)
       const { sandboxId, isNew, wasRestored } = await sandboxManager.getOrCreateSandbox(
-        session.sandboxId,
+        session?.sandboxId || undefined,
         snapshot?.commitSha
       )
 
       wsSandboxMap.set(ws, sandboxId)
       setCurrentSandbox(sandboxId)
 
-      // Update database with new sandbox ID if changed, and set status to running
-      if (sandboxId !== session.sandboxId) {
-        await setSessionSandboxStatus(sessionId, sandboxId, 'running')
-      } else {
-        await setSessionSandboxStatus(sessionId, sandboxId, 'running')
-      }
+      // Update database with sandbox status
+      await setSessionSandboxStatus(sessionId, sandboxId, 'running')
 
       // Notify client with status flags
       ws.send(JSON.stringify({
@@ -295,6 +292,47 @@ export async function createServer(options: CreateServerOptions = {}) {
         await setSessionSandbox(sessionId, '')
       } catch {
         // Ignore cleanup errors
+      }
+      // Re-throw so the caller knows the switch failed
+      throw error
+    }
+  }
+
+  // Synchronized sandbox switch - ensures only one switch happens at a time per connection
+  // and that all requests wait for the switch to complete
+  async function switchSandboxForSession(ws: WebSocket, sessionId: string, userId: string): Promise<void> {
+    // Wait for any in-progress switch to complete first
+    const existingSwitch = wsSandboxSwitchingPromise.get(ws)
+    if (existingSwitch) {
+      try {
+        await existingSwitch
+      } catch {
+        // Previous switch failed, continue with our switch
+      }
+    }
+
+    // Use a deferred pattern to avoid referencing switchPromise in its own initializer
+    let resolveSwitch: () => void
+    let rejectSwitch: (err: Error) => void
+    const switchPromise = new Promise<void>((resolve, reject) => {
+      resolveSwitch = resolve
+      rejectSwitch = reject
+    })
+
+    // Track the promise so other requests can wait for it
+    wsSandboxSwitchingPromise.set(ws, switchPromise)
+
+    try {
+      await upsertSession(sessionId, userId)
+      await tryReconnectSessionSandbox(ws, sessionId)
+      resolveSwitch!()
+    } catch (err) {
+      rejectSwitch!(err as Error)
+      throw err
+    } finally {
+      // Clean up - only delete if it's still our promise
+      if (wsSandboxSwitchingPromise.get(ws) === switchPromise) {
+        wsSandboxSwitchingPromise.delete(ws)
       }
     }
   }
@@ -315,150 +353,149 @@ export async function createServer(options: CreateServerOptions = {}) {
       // Set current connection context for sandbox provider
       currentWs = ws
 
-      // Ensure the right sandbox is set for this connection's messages
+      const text = typeof data === 'string' ? data : data.toString()
+
+      // Parse message early to handle resume synchronously
+      let parsed: { userId?: string; sessionId?: string; type?: string } | null = null
+      try {
+        parsed = JSON.parse(text) as { userId?: string; sessionId?: string; type?: string }
+      } catch {
+        // Not JSON - continue normally
+      }
+
+      // Register user for this connection
+      if (parsed?.userId && !wsUserMap.has(ws)) {
+        wsUserMap.set(ws, parsed.userId)
+      }
+
+      const userId = parsed?.userId || wsUserMap.get(ws)
+
+      // Set current user for playbook tools
+      if (userId) {
+        setCurrentPlaybookUser(userId)
+      }
+
+      // Handle resume messages SYNCHRONOUSLY - block until sandbox switch completes
+      // This is the key fix: we await the switch before forwarding to SDK
+      if (parsed?.type === 'resume' && parsed.sessionId) {
+        const resumeUserId = userId || FALLBACK_PROJECT_ID
+        const previousSession = wsSessionMap.get(ws)
+
+        // Update session tracking
+        wsSessionMap.set(ws, parsed.sessionId)
+        currentSessionId = parsed.sessionId
+
+        // Only switch sandbox if session actually changed
+        if (previousSession !== parsed.sessionId) {
+          try {
+            await switchSandboxForSession(ws, parsed.sessionId, resumeUserId)
+          } catch (err) {
+            console.error('[Server] Failed to handle resume:', err)
+          }
+        }
+
+        // Continue to forward resume to SDK for message history loading
+        // (don't return early - SDK needs this message)
+      }
+
+      // For all other messages, wait for any in-progress sandbox switch first
+      const switchPromise = wsSandboxSwitchingPromise.get(ws)
+      if (switchPromise) {
+        try {
+          await switchPromise
+        } catch {
+          // Switch failed, continue anyway - sandbox provider will create new one
+        }
+      }
+
+      // Now set the current sandbox (after any switch has completed)
       const connSandboxId = wsSandboxMap.get(ws)
       if (connSandboxId) {
         setCurrentSandbox(connSandboxId)
       }
 
-      const text = typeof data === 'string' ? data : data.toString()
-
-      // Extract user ID and session ID from message
-      try {
-        const parsed = JSON.parse(text) as { userId?: string; sessionId?: string; type?: string }
-
-        // Register user for this connection
-        if (parsed.userId && !wsUserMap.has(ws)) {
-          wsUserMap.set(ws, parsed.userId)
-        }
-
-        const userId = parsed.userId || wsUserMap.get(ws)
-
-        // Set current user for playbook tools
-        if (userId) {
-          setCurrentPlaybookUser(userId)
-        }
-
-        // Track session for this connection
-        if (parsed.sessionId) {
-          const previousSession = wsSessionMap.get(ws)
-          if (previousSession !== parsed.sessionId) {
-            wsSessionMap.set(ws, parsed.sessionId)
-            currentSessionId = parsed.sessionId
-          }
-        }
-
-        // Create or reconnect to sandbox when we see a chat message
-        // Uses getOrCreateSandbox for graceful degradation
-        if (userId && parsed.type === 'chat') {
-          const chatSessionId = parsed.sessionId || null
-          const chatUserId = userId
-
-          ;(async () => {
-            try {
-              if (wsSandboxMap.has(ws)) return
-
-              if (chatSessionId) {
-                await upsertSession(chatSessionId, chatUserId)
-                const session = await getSession(chatSessionId)
-
-                // Get latest snapshot commit SHA for validation
-                const projectId = getCurrentProjectId()
-                const latestSnapshot = await findLatestSnapshotForSession(projectId, chatSessionId)
-
-                // Use getOrCreateSandbox for graceful degradation
-                const { sandboxId, isNew, wasRestored } = await sandboxManager.getOrCreateSandbox(
-                  session?.sandboxId || undefined,
-                  latestSnapshot?.commitSha
-                )
-
-                wsSandboxMap.set(ws, sandboxId)
-                setCurrentSandbox(sandboxId)
-
-                // Update database with sandbox status
-                await setSessionSandboxStatus(chatSessionId, sandboxId, 'running')
-
-                ws.send(JSON.stringify({
-                  type: 'sandbox_changed',
-                  sandboxId,
-                  sessionId: chatSessionId,
-                  isNew,
-                  wasRestored,
-                }))
-                return
-              }
-
-              // No session ID - just create a new sandbox
-              const newSandboxId = await sandboxManager.createSandbox()
-              wsSandboxMap.set(ws, newSandboxId)
-              setCurrentSandbox(newSandboxId)
-
-              ws.send(JSON.stringify({
-                type: 'sandbox_changed',
-                sandboxId: newSandboxId,
-                sessionId: chatSessionId,
-                isNew: true,
-                wasRestored: false,
-              }))
-            } catch (err) {
-              console.error('[Server] Failed to setup sandbox:', err)
-            }
-          })()
-        }
-
-        // When resuming a session, try to reconnect to its existing sandbox
-        if (parsed.type === 'resume' && parsed.sessionId) {
-          const resumeUserId = userId || FALLBACK_PROJECT_ID
+      // Track session for this connection
+      if (parsed?.sessionId) {
+        const previousSession = wsSessionMap.get(ws)
+        if (previousSession !== parsed.sessionId) {
+          wsSessionMap.set(ws, parsed.sessionId)
           currentSessionId = parsed.sessionId
-
-          ;(async () => {
-            try {
-              await upsertSession(parsed.sessionId!, resumeUserId)
-              await tryReconnectSessionSandbox(ws, parsed.sessionId!)
-            } catch (err) {
-              console.error('[Server] Failed to handle resume:', err)
-            }
-          })()
         }
+      }
 
-        // When branching, restore sandbox to the state AT the branch point
-        if (parsed.type === 'branch') {
-          const branchMsg = parsed as { sourceSessionId?: string; branchAtMessageUuid?: string }
-          if (branchMsg.sourceSessionId && branchMsg.branchAtMessageUuid) {
-            const sandboxId = wsSandboxMap.get(ws)
-            if (sandboxId) {
-              try {
-                const projectId = getCurrentProjectId()
-                const branchPointUuid = branchMsg.branchAtMessageUuid
+      // Create or reconnect to sandbox when we see a chat message
+      // Uses getOrCreateSandbox for graceful degradation
+      if (userId && parsed?.type === 'chat') {
+        const chatSessionId = parsed.sessionId || null
+        const chatUserId = userId
+        const previousSession = wsSessionMap.get(ws)
+        const currentSandboxId = wsSandboxMap.get(ws)
 
-                let snapshot = await loadSnapshotByMessageUuid(projectId, branchPointUuid)
+        // Check if we need to switch sandbox (session changed or no sandbox yet)
+        const needsSwitch = !currentSandboxId || (chatSessionId && previousSession !== chatSessionId)
 
-                // If not found, try the parent (branch point might be a user message)
-                if (!snapshot) {
-                  const { messages: sourceMessages } = await sdkClient.loadMessages(branchMsg.sourceSessionId!)
-                  const branchPointMessage = sourceMessages.find(
-                    (msg) => (msg as { uuid?: string }).uuid === branchPointUuid
-                  )
-                  const parentUuid = branchPointMessage
-                    ? (branchPointMessage as { parentUuid?: string | null }).parentUuid || undefined
-                    : undefined
+        if (needsSwitch && chatSessionId) {
+          // Synchronously switch sandbox for this session
+          try {
+            await switchSandboxForSession(ws, chatSessionId, chatUserId)
+          } catch (err) {
+            console.error('[Server] Failed to switch sandbox for chat:', err)
+          }
+        } else if (!currentSandboxId && !chatSessionId) {
+          // No session ID and no sandbox - create a new one
+          try {
+            const newSandboxId = await sandboxManager.createSandbox()
+            wsSandboxMap.set(ws, newSandboxId)
+            setCurrentSandbox(newSandboxId)
 
-                  if (parentUuid) {
-                    snapshot = await loadSnapshotByMessageUuid(projectId, parentUuid)
-                  }
+            ws.send(JSON.stringify({
+              type: 'sandbox_changed',
+              sandboxId: newSandboxId,
+              sessionId: chatSessionId,
+              isNew: true,
+              wasRestored: false,
+            }))
+          } catch (err) {
+            console.error('[Server] Failed to create sandbox:', err)
+          }
+        }
+      }
+
+      // When branching, restore sandbox to the state AT the branch point
+      if (parsed?.type === 'branch') {
+        const branchMsg = parsed as { sourceSessionId?: string; branchAtMessageUuid?: string }
+        if (branchMsg.sourceSessionId && branchMsg.branchAtMessageUuid) {
+          const sandboxId = wsSandboxMap.get(ws)
+          if (sandboxId) {
+            try {
+              const projectId = getCurrentProjectId()
+              const branchPointUuid = branchMsg.branchAtMessageUuid
+
+              let snapshot = await loadSnapshotByMessageUuid(projectId, branchPointUuid)
+
+              // If not found, try the parent (branch point might be a user message)
+              if (!snapshot) {
+                const { messages: sourceMessages } = await sdkClient.loadMessages(branchMsg.sourceSessionId!)
+                const branchPointMessage = sourceMessages.find(
+                  (msg) => (msg as { uuid?: string }).uuid === branchPointUuid
+                )
+                const parentUuid = branchPointMessage
+                  ? (branchPointMessage as { parentUuid?: string | null }).parentUuid || undefined
+                  : undefined
+
+                if (parentUuid) {
+                  snapshot = await loadSnapshotByMessageUuid(projectId, parentUuid)
                 }
-
-                if (snapshot) {
-                  await sandboxManager.restoreSnapshot(sandboxId, snapshot.commitSha)
-                }
-              } catch (err) {
-                console.error('[Server] Failed to restore sandbox for branch:', err)
               }
+
+              if (snapshot) {
+                await sandboxManager.restoreSnapshot(sandboxId, snapshot.commitSha)
+              }
+            } catch (err) {
+              console.error('[Server] Failed to restore sandbox for branch:', err)
             }
           }
         }
-      } catch {
-        // Not JSON or missing fields - continue normally
       }
 
       webSocketHandler.onMessage(ws, text).catch((error) => {
@@ -474,11 +511,13 @@ export async function createServer(options: CreateServerOptions = {}) {
       const closingSandboxId = wsSandboxMap.get(ws)
       const closingSessionId = wsSessionMap.get(ws)
 
-      if (closingSandboxId) {
-        wsSandboxMap.delete(ws)
-        wsSessionMap.delete(ws)
-        wsUserMap.delete(ws)
+      // Always clean up maps on close
+      wsSandboxMap.delete(ws)
+      wsSessionMap.delete(ws)
+      wsUserMap.delete(ws)
+      wsSandboxSwitchingPromise.delete(ws)
 
+      if (closingSandboxId) {
         try {
           // Pause sandbox using beta API (proper pause, not just disconnect)
           await sandboxManager.pauseSandbox(closingSandboxId)
