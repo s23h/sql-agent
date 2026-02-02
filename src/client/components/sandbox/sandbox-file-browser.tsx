@@ -37,11 +37,58 @@ export function SandboxFileBrowser({ sandboxId: propSandboxId, refreshTrigger = 
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const prevFilePathsRef = useRef<Set<string>>(new Set());
+  const fetchDebounceRef = useRef<{ key: string; timer: NodeJS.Timeout | null }>({ key: '', timer: null });
+
+  // Clear files when starting a new session (sessionId becomes null)
+  useEffect(() => {
+    if (sessionId === null) {
+      setFiles([]);
+    }
+  }, [sessionId]);
 
   const isPreviewableFile = (name: string) => {
     const previewableExtensions = ['.html', '.htm', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp'];
     return previewableExtensions.some((ext) => name.toLowerCase().endsWith(ext));
   };
+
+  const debouncedFetchFiles = useCallback(async (sandbox: string, path: string, delay: number = 0) => {
+    const fetchKey = `${sandbox}:${path}`;
+
+    // Cancel any pending fetch
+    if (fetchDebounceRef.current.timer) {
+      clearTimeout(fetchDebounceRef.current.timer);
+    }
+
+    // Skip if we just fetched this exact combination
+    if (delay === 0 && fetchDebounceRef.current.key === fetchKey) {
+      return;
+    }
+
+    const doFetch = async () => {
+      fetchDebounceRef.current.key = fetchKey;
+      setIsLoading(true);
+      setError(null);
+      try {
+        const response = await fetch(
+          `/api/sandboxes/${sandbox}/files?path=${encodeURIComponent(path)}`
+        );
+        const data = await response.json();
+        const newFiles = Array.isArray(data) ? data : [];
+        setFiles(newFiles);
+        prevFilePathsRef.current = new Set(newFiles.map((f: SandboxFile) => f.path));
+      } catch {
+        setError("Failed to list files");
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    if (delay > 0) {
+      fetchDebounceRef.current.timer = setTimeout(doFetch, delay);
+    } else {
+      await doFetch();
+    }
+  }, []);
 
   const refreshFiles = useCallback(async () => {
     if (!selectedSandbox) return;
@@ -123,52 +170,21 @@ export function SandboxFileBrowser({ sandboxId: propSandboxId, refreshTrigger = 
   // Refresh files when sandbox or path changes
   useEffect(() => {
     if (selectedSandbox) {
-      (async () => {
-        setIsLoading(true);
-        setError(null);
-        try {
-          const response = await fetch(
-            `/api/sandboxes/${selectedSandbox}/files?path=${encodeURIComponent(currentPath)}`
-          );
-          const data = await response.json();
-          const newFiles = Array.isArray(data) ? data : [];
-          setFiles(newFiles);
-          // Initialize prev paths ref after load to avoid auto-previewing existing files
-          prevFilePathsRef.current = new Set(newFiles.map((f: SandboxFile) => f.path));
-        } catch {
-          setError("Failed to list files");
-        } finally {
-          setIsLoading(false);
-        }
-      })();
+      debouncedFetchFiles(selectedSandbox, currentPath, 0);
     }
-  }, [selectedSandbox, currentPath]);
+  }, [selectedSandbox, currentPath, debouncedFetchFiles]);
 
   // Refresh files when session changes (e.g., switching worldlines restores different snapshot)
   useEffect(() => {
     if (selectedSandbox && sessionId) {
-      // Small delay to allow snapshot restoration to complete
-      const timer = setTimeout(async () => {
-        setIsLoading(true);
-        setError(null);
-        try {
-          const response = await fetch(
-            `/api/sandboxes/${selectedSandbox}/files?path=${encodeURIComponent(currentPath)}`
-          );
-          const data = await response.json();
-          const newFiles = Array.isArray(data) ? data : [];
-          setFiles(newFiles);
-          // Update ref to avoid treating restored files as new
-          prevFilePathsRef.current = new Set(newFiles.map((f: SandboxFile) => f.path));
-        } catch {
-          setError("Failed to list files");
-        } finally {
-          setIsLoading(false);
-        }
-      }, 500);
-      return () => clearTimeout(timer);
+      debouncedFetchFiles(selectedSandbox, currentPath, 500);
     }
-  }, [sessionId, selectedSandbox, currentPath]);
+    return () => {
+      if (fetchDebounceRef.current.timer) {
+        clearTimeout(fetchDebounceRef.current.timer);
+      }
+    };
+  }, [sessionId, selectedSandbox, currentPath, debouncedFetchFiles]);
 
   // Refresh files when triggered by parent (e.g., after assistant turn completes)
   // Also auto-preview new previewable files (HTML, images)
