@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { useRoute } from '@/hooks/use-route'
+import { useProjectConfig } from '@/hooks/use-project-config'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { navigateTo } from '@/lib/route'
 
@@ -20,6 +21,7 @@ export function LeftSidebar({
   userButton,
 }: LeftSidebarProps) {
   const { sessionId: routeSessionId } = useRoute()
+  const { projectId } = useProjectConfig()
 
   const [sessions, setSessions] = useState<SessionSummary[]>([])
   const [playbooks, setPlaybooks] = useState<PlaybookSummary[]>([])
@@ -136,17 +138,17 @@ export function LeftSidebar({
       if (firstSession) {
         hasInitializedRef.current = true
         navigateTo(`/sessions/${encodeURIComponent(firstSession.id)}`, { replace: true })
-        onSessionSelect?.({ sessionId: firstSession.id, projectId: null })
+        onSessionSelect?.({ sessionId: firstSession.id, projectId })
       }
     }
-  }, [sessions, routeSessionId, onSessionSelect])
+  }, [sessions, routeSessionId, onSessionSelect, projectId])
 
   const handleSessionClick = useCallback(
     (sessionId: string) => {
       navigateTo(`/sessions/${encodeURIComponent(sessionId)}`)
-      onSessionSelect?.({ sessionId, projectId: null })
+      onSessionSelect?.({ sessionId, projectId })
     },
-    [onSessionSelect],
+    [onSessionSelect, projectId],
   )
 
   const handleRename = useCallback(
@@ -193,7 +195,7 @@ export function LeftSidebar({
             const nextSession = remainingSessions[0]
             if (nextSession) {
               navigateTo(`/sessions/${encodeURIComponent(nextSession.id)}`)
-              onSessionSelect?.({ sessionId: nextSession.id, projectId: null })
+              onSessionSelect?.({ sessionId: nextSession.id, projectId })
             }
           } else {
             // No sessions left, navigate to home

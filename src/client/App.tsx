@@ -105,6 +105,7 @@ function App() {
     setWorldlines,
     worldlinesSetFromBranchRef,
     handleWorldlineNavigate,
+    refreshWorldlines,
   } = useWorldlines({
     sessionId,
     projectId,
@@ -172,8 +173,11 @@ function App() {
         return
       }
       selectChatSession({ sessionId: nextSessionId, projectId })
+      // Force refresh worldlines to ensure they're fetched for the new session
+      // This handles cases where the useEffect might not trigger due to timing
+      refreshWorldlines()
     },
-    [selectChatSession, sessionId],
+    [selectChatSession, sessionId, refreshWorldlines],
   )
 
   const supportsSpeechRecognition = useMemo(() => {

@@ -34,8 +34,16 @@ export function useWorldlines({
   const worldlinesSetFromBranchRef = useRef(false)
 
   useEffect(() => {
-    if (!sessionId || !projectId) {
+    // Only clear worldlines when sessionId is explicitly null (user navigated away)
+    // Don't clear when projectId is null - it might still be loading async
+    if (!sessionId) {
       setWorldlines([])
+      return
+    }
+
+    // If projectId is null/loading, skip fetch but keep existing worldlines
+    // They'll be refreshed once projectId loads
+    if (!projectId) {
       return
     }
 

@@ -5,6 +5,7 @@ import { useEffect, useState } from 'react'
  */
 export function useProjectConfig() {
   const [projectId, setProjectId] = useState<string | null>(null)
+  const [isLoaded, setIsLoaded] = useState(false)
 
   useEffect(() => {
     fetch('/api/config')
@@ -13,9 +14,12 @@ export function useProjectConfig() {
         if (data.projectId) {
           setProjectId(data.projectId)
         }
+        setIsLoaded(true)
       })
-      .catch(() => {})
+      .catch(() => {
+        setIsLoaded(true)
+      })
   }, [])
 
-  return { projectId }
+  return { projectId, isLoaded }
 }
