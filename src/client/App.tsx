@@ -117,6 +117,13 @@ function App() {
     sessionIdRef.current = sessionId
   }, [sessionId])
 
+  // When sessionId changes to a non-null value (new session started), refresh sidebar
+  useEffect(() => {
+    if (sessionId) {
+      window.dispatchEvent(new CustomEvent('refresh-sessions'))
+    }
+  }, [sessionId])
+
   const sessionMessages = useMemo<UserMessage[]>(() => {
     return messages.map((message) => ({
       type: message.type,
@@ -258,6 +265,9 @@ function App() {
         if (toolsUsed.has('playbooks')) {
           window.dispatchEvent(new CustomEvent('refresh-playbooks'))
         }
+
+        // Refresh sessions list (catches renames, new sessions, etc.)
+        window.dispatchEvent(new CustomEvent('refresh-sessions'))
 
         // Clear for next turn
         clearToolsUsedThisTurn()
