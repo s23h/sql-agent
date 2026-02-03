@@ -17,6 +17,7 @@ import {
   SqlDescribeTableRenderer,
   PlaybookCreateRenderer,
   PlaybookUpdateRenderer,
+  WorldlineCreateRenderer,
 } from './renderers/sandbox-tool-renderers';
 
 export function getToolRenderer(name: string, context: ClaudeMessageContext): BaseToolRenderer {
@@ -57,6 +58,9 @@ export function getToolRenderer(name: string, context: ClaudeMessageContext): Ba
       return new PlaybookCreateRenderer();
     case 'mcp__playbooks__update_playbook':
       return new PlaybookUpdateRenderer();
+    // Worldline MCP tools
+    case 'mcp__worldlines__create_worldline':
+      return new WorldlineCreateRenderer();
     default:
       return new DefaultToolRenderer(name);
   }

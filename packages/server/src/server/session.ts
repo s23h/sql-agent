@@ -27,7 +27,7 @@ import type {
 // Only safe tools that don't access local filesystem
 // Sandbox and SQL tools are added via configureSessionMcpServers in server.ts
 const DEFAULT_ALLOWED_TOOLS: readonly string[] = [
-  "Task",
+  // "Task",        // Disabled - spawns subagents which don't have sandbox access
   "ExitPlanMode",
   // "Glob",        // Local filesystem - disabled
   // "Grep",        // Local filesystem - disabled

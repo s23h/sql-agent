@@ -275,17 +275,45 @@ export function useWebSocket({
       }
     }
 
+    // Handle browser window becoming visible again (e.g., switching back from another app)
+    // The WebSocket may have been closed by the browser while hidden
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') {
+        return
+      }
+
+      const socket = wsRef.current
+      const sessionId = getSessionIdFromLocation()
+
+      // If WebSocket is closed or closing, trigger reconnect
+      if (!socket || socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING) {
+        console.log('[WebSocket] Page visible, socket closed - reconnecting')
+        reconnectAttemptsRef.current = 0
+        connect()
+        return
+      }
+
+      // If WebSocket is open but we have a session ID that might not be synced, re-send resume
+      // This handles cases where the connection stayed open but server-side state was lost
+      if (socket.readyState === WebSocket.OPEN && sessionId) {
+        console.log('[WebSocket] Page visible, re-syncing session:', sessionId)
+        sendResumeMessage(sessionId)
+      }
+    }
+
     // Don't call handleRouteChange on mount - socket.onopen handles initial resume
     // handleRouteChange()
 
     window.addEventListener('popstate', handleRouteChange)
     window.addEventListener(ROUTE_CHANGE_EVENT, handleRouteChange)
+    document.addEventListener('visibilitychange', handleVisibilityChange)
 
     return () => {
       window.removeEventListener('popstate', handleRouteChange)
       window.removeEventListener(ROUTE_CHANGE_EVENT, handleRouteChange)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
     }
-  }, [sendResumeMessage])
+  }, [sendResumeMessage, connect])
 
   useEffect(() => {
     connect()

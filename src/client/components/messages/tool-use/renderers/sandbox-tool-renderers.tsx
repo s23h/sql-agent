@@ -1,4 +1,4 @@
-import { DatabaseIcon, CodeIcon, FileIcon, FolderIcon, TerminalIcon, BookmarkIcon } from "lucide-react";
+import { DatabaseIcon, CodeIcon, FileIcon, FolderIcon, TerminalIcon, BookmarkIcon, GitBranchIcon } from "lucide-react";
 import type { ReactNode } from "react";
 
 import type { ToolResultContentBlock } from "@claude-agent-kit/messages";
@@ -282,5 +282,34 @@ export class PlaybookUpdateRenderer extends BaseToolRenderer {
 
   protected computeResultSummary(): string | undefined {
     return "updated";
+  }
+}
+
+export class WorldlineCreateRenderer extends BaseToolRenderer {
+  constructor() {
+    super("Create Worldline");
+  }
+
+  header(_context: ClaudeMessageContext, input: ToolInput): ReactNode {
+    const direction = (input as { new_direction?: string }).new_direction || "";
+    // Truncate long directions
+    const shortDirection = direction.length > 40 ? direction.slice(0, 40) + "…" : direction;
+
+    return (
+      <span className="inline-flex items-center gap-2">
+        <GitBranchIcon className="size-4 text-emerald-500" />
+        <span className="font-medium">Branch</span>
+        {shortDirection && (
+          <>
+            <span className="text-muted-foreground">•</span>
+            <span className="text-muted-foreground text-xs">{shortDirection}</span>
+          </>
+        )}
+      </span>
+    );
+  }
+
+  protected computeResultSummary(): string | undefined {
+    return "switching";
   }
 }

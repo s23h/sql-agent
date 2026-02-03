@@ -155,6 +155,14 @@ export class WebSocketHandler {
       return;
     }
 
+    // Use sessionId from message if client doesn't have one yet.
+    // This handles the race condition where chat arrives before resume completes
+    // (e.g., user switches away from browser, WebSocket reconnects, user types
+    // before the resume response arrives).
+    if (message.sessionId && !client.sessionId) {
+      client.sessionId = message.sessionId;
+    }
+
     const content = message.content?.trim();
     if (!content) {
       this.send(ws, {

@@ -14,6 +14,7 @@ import { sandboxManager } from './sandbox/e2b-manager'
 import { createSandboxMcpServer, setCurrentSandbox, setSandboxProvider } from './tools/sandbox-tools'
 import { createSqlMcpServer } from './tools/sql-tools'
 import { createPlaybookMcpServer, setCurrentPlaybookUser } from './tools/playbook-tools'
+import { createBranchMcpServer, getPendingBranchDirection, setPendingBranchDirection } from './tools/branch-tools'
 import { saveBranchMetadata, loadBranchMetadata, getWorldlineSiblings } from './api/branches'
 import { getCurrentProjectId } from './api/projects'
 import { saveSnapshot, findLatestSnapshotForSession, loadSnapshotByMessageUuid, getSessionSnapshots } from './sandbox/snapshot-storage'
@@ -42,10 +43,11 @@ export async function createServer(options: CreateServerOptions = {}) {
   const isProduction = process.env.NODE_ENV === 'production'
   const base = process.env.BASE ?? '/'
 
-  // Create in-process MCP servers for sandbox, SQL, and playbook tools
+  // Create in-process MCP servers for sandbox, SQL, playbook, and worldline tools
   const sandboxMcp = createSandboxMcpServer()
   const sqlMcp = createSqlMcpServer()
   const playbookMcp = createPlaybookMcpServer()
+  const worldlinesMcp = createBranchMcpServer()
 
   // Configure session to use these MCP servers
   configureSessionMcpServers(
@@ -53,6 +55,7 @@ export async function createServer(options: CreateServerOptions = {}) {
       sandbox: sandboxMcp,
       sql: sqlMcp,
       playbooks: playbookMcp,
+      worldlines: worldlinesMcp,
     },
     [
       // Sandbox tools
@@ -68,6 +71,8 @@ export async function createServer(options: CreateServerOptions = {}) {
       // Playbook tools
       'mcp__playbooks__create_playbook',
       'mcp__playbooks__update_playbook',
+      // Worldline tools
+      'mcp__worldlines__create_worldline',
     ]
   )
 
@@ -235,6 +240,56 @@ export async function createServer(options: CreateServerOptions = {}) {
 
         // Notify client that turn is complete (triggers file refresh)
         ws.send(JSON.stringify({ type: 'turn_complete', sessionId, sandboxId }))
+
+        // Check for pending worldline branch from tool call
+        const pendingDirection = getPendingBranchDirection()
+        if (pendingDirection) {
+          setPendingBranchDirection(null)
+
+          // Find the SECOND-TO-LAST actual user message as branch point
+          // We skip the last one because that's the "branch here" request itself
+          // We want to branch at the message BEFORE it, replacing that with the new direction
+          const actualUserMessages: string[] = []
+          for (let i = 0; i < persistedMessages.length; i++) {
+            const msg = persistedMessages[i] as {
+              type?: string
+              uuid?: string
+              tool_use_result?: unknown
+              isSynthetic?: boolean
+              message?: { content?: Array<{type?: string, text?: string}> }
+            }
+            if (msg.type === 'user' && msg.uuid) {
+              const isToolResult = !!msg.tool_use_result
+              const isSynthetic = !!msg.isSynthetic
+              // Also check if content contains tool_result blocks (another form of tool result)
+              const hasToolResultContent = msg.message?.content?.some(b => b.type === 'tool_result')
+              // Only count as real user message if has text content
+              const textBlock = msg.message?.content?.find(b => b.type === 'text')
+              const hasText = !!textBlock?.text
+
+              // A real user message must have text content and not be a tool result
+              if (hasText && !isToolResult && !isSynthetic && !hasToolResultContent) {
+                actualUserMessages.push(msg.uuid)
+              }
+            }
+          }
+
+          // Need at least 2 user messages: one to branch at, one that requested the branch
+          if (actualUserMessages.length >= 2) {
+            // Branch at second-to-last user message (the one before the branch request)
+            const branchAtMessageUuid = actualUserMessages[actualUserMessages.length - 2]
+            console.log(`[Server] Pending branch: found ${actualUserMessages.length} user messages, branching at second-to-last (${branchAtMessageUuid.slice(0, 8)}...)`)
+            // Tell client to initiate the branch (mimics UI click)
+            ws.send(JSON.stringify({
+              type: 'pending_branch',
+              sourceSessionId: sessionId,
+              branchAtMessageUuid,
+              content: pendingDirection,
+            }))
+          } else {
+            console.log(`[Server] Pending branch: not enough user messages (${actualUserMessages.length}), need at least 2`)
+          }
+        }
       } catch (error) {
         console.error('[Server] Failed to create snapshot:', error)
         // Still notify client even if snapshot failed

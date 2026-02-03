@@ -100,13 +100,7 @@ function App() {
   } = useSandboxRefresh()
 
   // Extract worldlines logic
-  const {
-    worldlines,
-    setWorldlines,
-    worldlinesSetFromBranchRef,
-    handleWorldlineNavigate,
-    refreshWorldlines,
-  } = useWorldlines({
+  const { worldlines, handleWorldlineNavigate, refreshWorldlines } = useWorldlines({
     sessionId,
     projectId,
     selectChatSession,
@@ -117,6 +111,9 @@ function App() {
   useEffect(() => {
     sessionIdRef.current = sessionId
   }, [sessionId])
+
+  // Ref for sendBranchMessage to break circular dependency with handleServerMessage
+  const sendBranchMessageRef = useRef<((sourceSessionId: string, branchAtMessageUuid: string, content: string) => void) | null>(null)
 
   // When sessionId changes to a non-null value (new session started), refresh sidebar
   useEffect(() => {
@@ -226,24 +223,40 @@ function App() {
 
       if (raw.type === 'branched') {
         const newSessionId = raw.newSessionId as string
-        const branchedWorldlines = (
-          raw as { worldlines?: import('@/components/messages/worldline-navigator').WorldlineBranch[] }
-        ).worldlines
 
         if (newSessionId && projectId) {
-          // Set worldlines BEFORE selectChatSession to avoid race condition
-          // The ref prevents the useEffect from overwriting these worldlines
-          if (branchedWorldlines && branchedWorldlines.length > 0) {
-            worldlinesSetFromBranchRef.current = true
-            setWorldlines(branchedWorldlines)
-          }
-
           // Navigate to the new branch - metadata was already saved server-side
           navigateTo(
             `/projects/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(newSessionId)}`,
           )
           selectChatSession({ sessionId: newSessionId, projectId })
+          // Force refresh worldlines after session switch to ensure they're fetched
+          // after messages load (same pattern as handleSessionSelect)
+          refreshWorldlines()
         }
+        return
+      }
+
+      // Handle AI-initiated branch via create_worldline tool
+      if (raw.type === 'pending_branch') {
+        const { sourceSessionId, branchAtMessageUuid, content } = raw as {
+          sourceSessionId: string
+          branchAtMessageUuid: string
+          content: string
+        }
+
+        // Clear messages to branch point (same as UI flow in use-inline-editing.ts)
+        setMessages((prev) => {
+          const branchIndex = prev.findIndex(
+            (m) => m.uuid === branchAtMessageUuid || m.id === branchAtMessageUuid
+          )
+          return branchIndex > 0 ? prev.slice(0, branchIndex) : []
+        })
+
+        // Small delay to let original session fully release MCP server resources
+        setTimeout(() => {
+          sendBranchMessageRef.current?.(sourceSessionId, branchAtMessageUuid, content)
+        }, 500)
         return
       }
 
@@ -336,8 +349,7 @@ function App() {
       triggerImmediateFileRefresh,
       clearToolsUsedThisTurn,
       toolsUsedThisTurnRef,
-      worldlinesSetFromBranchRef,
-      setWorldlines,
+      refreshWorldlines,
     ],
   )
 
@@ -354,6 +366,11 @@ function App() {
     userId: user?.id,
     onMessage: handleServerMessage,
   })
+
+  // Update ref for use in handleServerMessage (breaks circular dependency)
+  useEffect(() => {
+    sendBranchMessageRef.current = sendBranchMessage
+  }, [sendBranchMessage])
 
   const { setPermissionMode, setThinkingLevel, setReportMode } =
     useChatSessionOptions(setSDKOptions)
