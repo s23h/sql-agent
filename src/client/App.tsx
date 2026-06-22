@@ -18,7 +18,6 @@ import { MessagesPane } from '@/components/chat/messages-pane'
 import { LeftSidebar } from '@/components/left-sidebar/left-sidebar'
 import { SandboxFileBrowser } from '@/components/sandbox/sandbox-file-browser'
 import { ConnectorsList } from '@/components/connectors/connectors-list'
-import { ComparisonView } from '@/components/comparison/comparison-view'
 import type { SessionSelectPayload } from '@/components/left-sidebar/types'
 import {
   ResizableHandle,
@@ -85,14 +84,6 @@ function App() {
   const handleOutcomingMessage = useOutcomingMessageHandler()
 
   const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([])
-
-  // Comparison demo route (/compare) — set after mount to avoid SSR mismatch
-  const [route, setRoute] = useState<'chat' | 'compare'>('chat')
-  useEffect(() => {
-    if (typeof window !== 'undefined' && ['/compare', '/versus'].includes(window.location.pathname)) {
-      setRoute('compare')
-    }
-  }, [])
 
   // Extract project config
   const { projectId } = useProjectConfig()
@@ -520,9 +511,6 @@ function App() {
 
       {/* Main app for authenticated users */}
       <SignedIn>
-        {route === 'compare' ? (
-          <ComparisonView />
-        ) : (
         <>
         <ChatHeader />
 
@@ -633,7 +621,6 @@ function App() {
           </ResizablePanelGroup>
         </main>
         </>
-        )}
       </SignedIn>
     </div>
   )
